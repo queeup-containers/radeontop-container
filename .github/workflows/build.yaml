@@ -1,0 +1,65 @@
+name: Build radeontop container with apko
+on: 
+  workflow_dispatch:
+  schedule:
+    - cron: '45 21 */15 * *' # Runs at 21:45, every 15 days.
+
+jobs:
+  build-job:
+    env:
+      IMAGE_REPO: "ghcr.io/${{ github.repository }}"
+      APP_NAME: "radeontop"
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Get current date
+        id: date_step
+        run: |
+          echo "date=$(date +'%Y%m%d')" >> $GITHUB_OUTPUT
+
+      - name: Check latest versions
+        id: version_step
+        run: |
+          get_latest_version() {
+            curl -s https://pkgs.alpinelinux.org/package/edge/community/x86_64/${{ env.APP_NAME}} | \
+              grep -A 3 'Version' | grep -oP '<strong>\K[^<]+'
+          }
+          LATEST_VER=$(get_latest_version)
+          echo "latest_version=$LATEST_VER" >> $GITHUB_OUTPUT
+
+      - name: Check if image needs building
+        id: check_build
+        run: |
+          LATEST_VER="${{ steps.version_step.outputs.latest_version }}"
+          EXISTING_TAGS=$(skopeo list-tags docker://${{ env.IMAGE_REPO }} 2>/dev/null | jq -r '.Tags[]' || true)
+          if echo "$EXISTING_TAGS" | grep -q "^${LATEST_VER}$"; then
+            echo "Version ($LATEST_VER) already exists. Build not needed."
+            echo "build_needed=false" >> $GITHUB_OUTPUT
+          else
+            echo "New version ($LATEST_VER) found. Building."
+            echo "build_needed=true" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.check_build.outputs.build_needed == 'true'
+
+      - name: Build and push OCI archive with apko
+        if: steps.check_build.outputs.build_needed == 'true'
+        run: |
+          docker run -v ${{ github.workspace }}:/work -v ${{ github.workspace }}/.docker:/root/.docker cgr.dev/chainguard/apko \
+            login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+          docker run -v ${{ github.workspace }}:/work -v ${{ github.workspace }}/.docker:/root/.docker cgr.dev/chainguard/apko \
+            publish ${{ env.APP_NAME}}.yaml \
+              ${{ env.IMAGE_REPO }}:latest \
+              ${{ env.IMAGE_REPO }}:${{ steps.version_step.outputs.latest_version }} \
+              ${{ env.IMAGE_REPO }}:${{ steps.date_step.outputs.date }}
+
+      - name: Clean up old container images from GHCR
+        if: steps.check_build.outputs.build_needed == 'true'
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          keep-n-tagged: 5
+          delete-untagged: true
+          delete-orphaned-images: true
